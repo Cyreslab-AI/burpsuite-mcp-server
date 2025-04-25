@@ -2,6 +2,10 @@
 
 A Model Context Protocol (MCP) server that provides an interface for interacting with Burpsuite Professional's scanning and proxy functionality.
 
+<a href="https://glama.ai/mcp/servers/@Cyreslab-AI/burpsuite-mcp-server">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@Cyreslab-AI/burpsuite-mcp-server/badge" alt="Burpsuite Server MCP server" />
+</a>
+
 ## Overview
 
 This MCP server allows AI assistants to interact with Burpsuite Professional for web security testing and vulnerability scanning. It provides tools for:
