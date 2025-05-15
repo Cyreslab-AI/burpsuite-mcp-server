@@ -1,5 +1,6 @@
 # Burpsuite MCP Server
 
+[![smithery badge](https://smithery.ai/badge/@Cyreslab-AI/burpsuite-mcp-server)](https://smithery.ai/server/@Cyreslab-AI/burpsuite-mcp-server)
 A Model Context Protocol (MCP) server that provides an interface for interacting with Burpsuite Professional's scanning and proxy functionality.
 
 <a href="https://glama.ai/mcp/servers/@Cyreslab-AI/burpsuite-mcp-server">
@@ -64,6 +65,15 @@ The server provides the following resources:
 
 ## Installation
 
+### Installing via Smithery
+
+To install Burpsuite Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@Cyreslab-AI/burpsuite-mcp-server):
+
+```bash
+npx -y @smithery/cli install @Cyreslab-AI/burpsuite-mcp-server --client claude
+```
+
+### Manual Installation
 1. Build the server:
 
    ```bash
