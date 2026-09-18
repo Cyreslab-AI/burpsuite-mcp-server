@@ -1,13 +1,39 @@
 #!/usr/bin/env node
 
 /**
- * Burpsuite MCP Server
+ * Burp Suite MCP Server
  *
- * This server provides an interface for interacting with Burpsuite Professional's
- * scanning and proxy functionality through the Model Context Protocol.
+ * This server provides an interface for interacting with Burp Suite
+ * Professional's scanner through the Model Context Protocol.
  *
- * It implements mock functionality that can later be connected to the
- * Burpsuite REST API for real-world usage.
+ * It calls Burp Suite Professional's built-in local REST API. That API
+ * is enabled from the Burp desktop application under
+ * Settings > Suite > REST API ("Service running"), which also generates
+ * the API key used below. The default base URL is http://127.0.0.1:1337
+ * and the access pattern is:
+ *
+ *   http://<host>:<port>/<api-key>/v0.1/...
+ *
+ * IMPORTANT: PortSwigger does not publish a full static schema for this
+ * API. It is self-documenting: once Burp is running with the REST API
+ * enabled, browse to
+ *
+ *   http://<host>:<port>/<api-key>/v0.1/<api-key>
+ *
+ * to see the exact request/response shapes for your Burp version. The
+ * request/response handling below is built from PortSwigger's public
+ * documentation plus cross-referencing third-party clients of this same
+ * API (e.g. the "burpa" project), and defensively tolerates minor field
+ * naming differences. It has been verified by code review and against
+ * connection-failure paths, but NOT against a live Burp Suite instance
+ * (none was available while building this).
+ *
+ * Burp Suite Professional's REST API only supports launching scans and
+ * reading scan status/issues. It has no endpoint for proxy history or
+ * the site map — that data is only reachable through Burp's separate
+ * Montoya extension API or the desktop UI. The get_proxy_history and
+ * get_site_map tools are kept for interface compatibility, but they
+ * return an explanatory error instead of fabricated data.
  */
 
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
@@ -16,421 +42,305 @@ import {
   ProtocolError,
   ProtocolErrorCode,
 } from "@modelcontextprotocol/server";
+import axios, { AxiosInstance } from "axios";
 
-// Types for Burpsuite data structures
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-/**
- * Represents a vulnerability issue found during scanning
- */
-interface Issue {
-  id: string;
-  name: string;
-  severity: "high" | "medium" | "low" | "info";
-  confidence: "certain" | "firm" | "tentative";
-  host: string;
-  path: string;
-  description: string;
-  remediation: string;
-  request?: string;
-  response?: string;
+const BURP_API_URL = process.env.BURP_API_URL;
+const BURP_API_KEY = process.env.BURP_API_KEY;
+
+if (!BURP_API_URL) {
+  throw new Error(
+    "BURP_API_URL environment variable is required (e.g. http://localhost:1337). " +
+      'Enable the REST API in Burp Suite Professional under Settings > Suite > REST API ' +
+      '("Service running") and set this to the configured service URL.',
+  );
 }
 
-/**
- * Represents a scan job
- */
-interface Scan {
-  id: string;
+if (!BURP_API_KEY) {
+  throw new Error(
+    "BURP_API_KEY environment variable is required. Generate an API key from Burp " +
+      "Suite Professional's Settings > Suite > REST API panel and set this to that key's value.",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Burp Suite Professional REST API client
+// ---------------------------------------------------------------------------
+
+interface StartScanParams {
   target: string;
-  status: "queued" | "running" | "completed" | "failed";
-  startTime: string;
-  endTime?: string;
-  progress?: number;
-  issues: Issue[];
+  /**
+   * Passed through as-is to Burp's `scope` field. Shape is not fully
+   * documented publicly; check your instance's self-documenting API.
+   */
+  scope?: unknown;
+  /**
+   * Passed through as-is to Burp's `scan_configurations` field (e.g.
+   * references to named configurations from Scanner > Scan
+   * configurations). If omitted, Burp uses its default configuration
+   * (a full crawl and audit).
+   */
+  scanConfigurations?: unknown[];
+  /** Passed through as-is to Burp's `application_logins` field. */
+  applicationLogins?: unknown[];
 }
 
-/**
- * Represents an HTTP request/response pair in the proxy history
- */
-interface ProxyHistoryItem {
-  id: string;
-  host: string;
-  method: string;
-  url: string;
-  statusCode: number;
-  request: string;
-  response: string;
-  time: string;
-  size: number;
-  mimeType: string;
-}
+class BurpApiClient {
+  private readonly http: AxiosInstance;
 
-/**
- * Represents a site map entry
- */
-interface SiteMapItem {
-  id: string;
-  url: string;
-  method: string;
-  statusCode: number;
-  mimeType: string;
-  size: number;
-  parameters: boolean;
-}
-
-// Mock data storage
-const mockScans: { [id: string]: Scan } = {};
-const mockProxyHistory: ProxyHistoryItem[] = [
-  {
-    id: "1",
-    host: "example.com",
-    method: "GET",
-    url: "https://example.com/",
-    statusCode: 200,
-    request:
-      "GET / HTTP/1.1\nHost: example.com\nUser-Agent: Mozilla/5.0\nAccept: */*\n\n",
-    response:
-      "HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Length: 1256\n\n<!DOCTYPE html><html><head><title>Example Domain</title></head><body><h1>Example Domain</h1><p>This domain is for use in illustrative examples in documents.</p></body></html>",
-    time: new Date().toISOString(),
-    size: 1256,
-    mimeType: "text/html",
-  },
-  {
-    id: "2",
-    host: "example.com",
-    method: "GET",
-    url: "https://example.com/assets/style.css",
-    statusCode: 200,
-    request:
-      "GET /assets/style.css HTTP/1.1\nHost: example.com\nUser-Agent: Mozilla/5.0\nAccept: text/css\n\n",
-    response:
-      "HTTP/1.1 200 OK\nContent-Type: text/css\nContent-Length: 128\n\nbody { font-family: sans-serif; } h1 { color: #333; }",
-    time: new Date().toISOString(),
-    size: 128,
-    mimeType: "text/css",
-  },
-];
-
-const mockSiteMap: SiteMapItem[] = [
-  {
-    id: "1",
-    url: "https://example.com/",
-    method: "GET",
-    statusCode: 200,
-    mimeType: "text/html",
-    size: 1256,
-    parameters: false,
-  },
-  {
-    id: "2",
-    url: "https://example.com/assets/style.css",
-    method: "GET",
-    statusCode: 200,
-    mimeType: "text/css",
-    size: 128,
-    parameters: false,
-  },
-  {
-    id: "3",
-    url: "https://example.com/login",
-    method: "GET",
-    statusCode: 200,
-    mimeType: "text/html",
-    size: 2048,
-    parameters: false,
-  },
-  {
-    id: "4",
-    url: "https://example.com/api/user",
-    method: "POST",
-    statusCode: 200,
-    mimeType: "application/json",
-    size: 512,
-    parameters: true,
-  },
-];
-
-// Common vulnerability types for mock data
-const commonVulnerabilities = [
-  {
-    name: "SQL Injection",
-    description:
-      "SQL injection vulnerability detected in parameter. The application appears to be vulnerable to SQL injection attacks, which could allow an attacker to manipulate database queries.",
-    remediation:
-      "Use parameterized queries or prepared statements instead of building SQL queries through string concatenation. Apply input validation and use an ORM if possible.",
-  },
-  {
-    name: "Cross-Site Scripting (XSS)",
-    description:
-      "Cross-site scripting vulnerability detected. The application reflects user input without proper encoding, which could allow attackers to inject malicious scripts.",
-    remediation:
-      "Implement proper output encoding for all user-controlled data. Use Content-Security-Policy headers and consider using frameworks that automatically escape output.",
-  },
-  {
-    name: "Insecure Direct Object Reference",
-    description:
-      "Insecure direct object reference vulnerability detected. The application exposes references to internal implementation objects, allowing attackers to manipulate these references to access unauthorized data.",
-    remediation:
-      "Implement proper access controls and use indirect reference maps. Validate that the user is authorized to access the requested object.",
-  },
-  {
-    name: "Information Disclosure",
-    description:
-      "Information disclosure vulnerability detected. The application reveals sensitive information such as server versions, file paths, or database details in responses.",
-    remediation:
-      "Configure proper error handling to avoid leaking sensitive information. Remove unnecessary headers and implement security headers like X-Content-Type-Options.",
-  },
-];
-
-// Helper function to generate mock issues for a scan
-function generateMockIssues(host: string, count: number): Issue[] {
-  const issues: Issue[] = [];
-  const paths = [
-    "/login",
-    "/api/user",
-    "/search",
-    "/profile",
-    "/admin",
-    "/settings",
-  ];
-  const severities: Array<"high" | "medium" | "low" | "info"> = [
-    "high",
-    "medium",
-    "low",
-    "info",
-  ];
-  const confidences: Array<"certain" | "firm" | "tentative"> = [
-    "certain",
-    "firm",
-    "tentative",
-  ];
-
-  for (let i = 0; i < count; i++) {
-    const vulnType =
-      commonVulnerabilities[
-        Math.floor(Math.random() * commonVulnerabilities.length)
-      ];
-    const path = paths[Math.floor(Math.random() * paths.length)];
-    const severity = severities[Math.floor(Math.random() * severities.length)];
-    const confidence =
-      confidences[Math.floor(Math.random() * confidences.length)];
-
-    issues.push({
-      id: `issue-${i + 1}`,
-      name: vulnType.name,
-      severity,
-      confidence,
-      host,
-      path,
-      description: vulnType.description,
-      remediation: vulnType.remediation,
-      request: `GET ${path} HTTP/1.1\nHost: ${host}\nUser-Agent: Mozilla/5.0\n\n`,
-      response: `HTTP/1.1 200 OK\nContent-Type: text/html\n\n<html><body>Example response</body></html>`,
+  constructor(baseUrl: string, apiKey: string) {
+    const trimmedBase = baseUrl.replace(/\/+$/, "");
+    this.http = axios.create({
+      baseURL: `${trimmedBase}/${apiKey}/v0.1`,
+      timeout: 15000,
+      headers: { "Content-Type": "application/json" },
     });
   }
 
-  return issues;
+  /**
+   * Launch a new scan via POST /v0.1/scan.
+   *
+   * Burp responds with an empty body and the new task's location in the
+   * `Location` header. We defensively also check the response body for
+   * a task/id field in case a given Burp version returns one directly.
+   */
+  async startScan(params: StartScanParams): Promise<{ taskId: string }> {
+    const body: Record<string, unknown> = { urls: [params.target] };
+    if (params.scope !== undefined) body.scope = params.scope;
+    if (params.scanConfigurations !== undefined) {
+      body.scan_configurations = params.scanConfigurations;
+    }
+    if (params.applicationLogins !== undefined) {
+      body.application_logins = params.applicationLogins;
+    }
+
+    const response = await this.http.post("/scan", body);
+
+    const locationHeader =
+      response.headers?.["location"] ?? response.headers?.["Location"];
+    let taskId: string | undefined;
+    if (typeof locationHeader === "string" && locationHeader.length > 0) {
+      const segments = locationHeader.split("/").filter(Boolean);
+      taskId = segments[segments.length - 1];
+    }
+
+    if (!taskId) {
+      const data = response.data as Record<string, unknown> | undefined;
+      const fallback = data?.["task_id"] ?? data?.["id"];
+      if (typeof fallback === "string" || typeof fallback === "number") {
+        taskId = String(fallback);
+      }
+    }
+
+    if (!taskId) {
+      throw new Error(
+        "Burp accepted the scan request but did not return a task id " +
+          "(no Location header and no task_id/id field in the response body). " +
+          "Check your Burp version's self-documented API for the exact response shape.",
+      );
+    }
+
+    return { taskId };
+  }
+
+  /**
+   * Fetch a scan's current status/metrics/issues via GET /v0.1/scan/{task_id}.
+   * Issues (when present) come back embedded in this same response.
+   */
+  async getScan(taskId: string): Promise<Record<string, unknown>> {
+    const response = await this.http.get(
+      `/scan/${encodeURIComponent(taskId)}`,
+    );
+    return response.data as Record<string, unknown>;
+  }
+}
+
+const burpClient = new BurpApiClient(BURP_API_URL, BURP_API_KEY);
+
+// ---------------------------------------------------------------------------
+// Response normalization helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalized view of a single Burp issue. Field names on the raw API
+ * response are not fully confirmed publicly, so this reads several
+ * plausible/known key names and degrades gracefully instead of throwing.
+ */
+interface NormalizedIssue {
+  severity: string;
+  confidence: string;
+  name: string;
+  type_index?: unknown;
+  host: string;
+  path: string;
+  description?: string;
+  remediation?: string;
+  evidence?: unknown;
+}
+
+function extractIssues(scanData: Record<string, unknown>): NormalizedIssue[] {
+  const events =
+    (scanData["issue_events"] as unknown[] | undefined) ??
+    (scanData["issues"] as unknown[] | undefined) ??
+    [];
+
+  if (!Array.isArray(events)) {
+    return [];
+  }
+
+  return events.map((event) => {
+    const record = (event ?? {}) as Record<string, unknown>;
+    const issue = (record["issue"] as Record<string, unknown> | undefined) ??
+      record;
+    const issueType =
+      (issue["issue_type"] as Record<string, unknown> | undefined) ?? {};
+
+    return {
+      severity: String(
+        issue["severity"] ?? issue["original_severity"] ?? "unknown",
+      ),
+      confidence: String(
+        issue["confidence"] ?? issue["original_confidence"] ?? "unknown",
+      ),
+      name: String(
+        issueType["name"] ?? issue["name"] ?? "Unknown issue",
+      ),
+      type_index: issueType["type_index"] ?? issue["type_index"],
+      host: String(issue["origin"] ?? issue["host"] ?? ""),
+      path: String(issue["path"] ?? ""),
+      description:
+        (issue["description_html"] as string | undefined) ??
+        (issue["description"] as string | undefined),
+      remediation:
+        (issue["remediation_html"] as string | undefined) ??
+        (issue["remediation"] as string | undefined),
+      evidence: issue["evidence"],
+    };
+  });
+}
+
+function matchesSeverityFilter(issue: NormalizedIssue, filter: string): boolean {
+  if (filter === "all") return true;
+  const severity = issue.severity.toLowerCase();
+  if (filter === "info") {
+    return severity === "info" || severity === "information";
+  }
+  return severity === filter;
 }
 
 /**
- * Create an MCP server for Burpsuite functionality
+ * Convert an error thrown by the Burp API client into a clear
+ * ProtocolError instead of ever falling back to fabricated data.
  */
+function mapBurpApiError(error: unknown, context: string): ProtocolError {
+  if (axios.isAxiosError(error)) {
+    if (!error.response) {
+      const reason = error.code ? ` (${error.code})` : "";
+      return new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `Could not reach the Burp Suite REST API at ${BURP_API_URL}${reason} while ${context}. ` +
+          'Confirm Burp Suite Professional is running with the REST API enabled ' +
+          '(Settings > Suite > REST API > "Service running"), and that BURP_API_URL ' +
+          `points at the correct host and port. Underlying error: ${error.message}`,
+      );
+    }
+
+    const status = error.response.status;
+
+    if (status === 401 || status === 403) {
+      return new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `Burp Suite REST API rejected the request (HTTP ${status}) while ${context}. ` +
+          "Confirm BURP_API_KEY is correct and that key is still enabled in " +
+          "Settings > Suite > REST API.",
+      );
+    }
+
+    if (status === 404) {
+      return new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `Burp Suite REST API returned 404 Not Found while ${context}. ` +
+          "This usually means the scan id does not exist (it may have been " +
+          "cleared, or belongs to a different Burp session), or that " +
+          "BURP_API_URL/BURP_API_KEY do not match the base path Burp expects " +
+          "(http://<host>:<port>/<api-key>/v0.1/...).",
+      );
+    }
+
+    const body =
+      typeof error.response.data === "string"
+        ? error.response.data
+        : JSON.stringify(error.response.data);
+    return new ProtocolError(
+      ProtocolErrorCode.InternalError,
+      `Burp Suite REST API error (HTTP ${status}) while ${context}: ${body || error.message}`,
+    );
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return new ProtocolError(
+    ProtocolErrorCode.InternalError,
+    `Unexpected error while ${context}: ${message}`,
+  );
+}
+
+/**
+ * Burp task ids are plain integers, so a caller may reasonably pass
+ * scan_id as either a string or a JSON number. Normalize to a string
+ * (used directly in the URL path) and reject anything else.
+ */
+function coerceScanId(value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function unsupportedFeatureMessage(toolName: "get_proxy_history" | "get_site_map"): string {
+  const feature = toolName === "get_proxy_history" ? "proxy history" : "the site map";
+  return (
+    `Not available: Burp Suite Professional's REST API does not expose ${feature}. ` +
+    "The local REST API (http://<host>:<port>/<api-key>/v0.1/...) only supports " +
+    "launching scans and reading scan status/issues. Proxy history and site map " +
+    "data are only reachable through Burp's separate Montoya extension API " +
+    "(a Java/Kotlin/Python extension running inside Burp) or the desktop UI " +
+    "(Proxy > HTTP history, Target > Site map). This tool is kept for interface " +
+    "compatibility but intentionally returns this message instead of fabricated data."
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MCP server
+// ---------------------------------------------------------------------------
+
 const server = new Server(
   {
     name: "burpsuite-server",
-    version: "0.1.0",
+    version: "0.2.0",
   },
   {
     capabilities: {
-      resources: {},
       tools: {},
     },
   },
 );
 
 /**
- * Handler for listing available resources.
- * Exposes scan results and proxy history as resources.
- */
-server.setRequestHandler("resources/list", async () => {
-  const resources = [];
-
-  // Add scan resources
-  for (const [id, scan] of Object.entries(mockScans)) {
-    resources.push({
-      uri: `burpsuite://scan/${id}`,
-      mimeType: "application/json",
-      name: `Scan of ${scan.target}`,
-      description: `Vulnerability scan of ${scan.target} (${scan.status})`,
-    });
-  }
-
-  // Add a proxy history resource
-  resources.push({
-    uri: `burpsuite://proxy/history`,
-    mimeType: "application/json",
-    name: "Proxy History",
-    description: "HTTP/HTTPS traffic captured by Burp Proxy",
-  });
-
-  // Add a site map resource
-  resources.push({
-    uri: `burpsuite://sitemap`,
-    mimeType: "application/json",
-    name: "Site Map",
-    description: "Structure of discovered websites",
-  });
-
-  return { resources };
-});
-
-/**
- * Handler for resource templates.
- * Defines templates for accessing specific scan results and proxy history items.
- */
-server.setRequestHandler("resources/templates/list", async () => {
-  return {
-    resourceTemplates: [
-      {
-        uriTemplate: "burpsuite://scan/{scanId}",
-        name: "Scan Results",
-        mimeType: "application/json",
-        description: "Results of a specific vulnerability scan",
-      },
-      {
-        uriTemplate: "burpsuite://scan/{scanId}/issue/{issueId}",
-        name: "Issue Details",
-        mimeType: "application/json",
-        description: "Details of a specific vulnerability issue",
-      },
-      {
-        uriTemplate: "burpsuite://proxy/history/{itemId}",
-        name: "Proxy History Item",
-        mimeType: "application/json",
-        description: "Details of a specific HTTP/HTTPS request/response pair",
-      },
-    ],
-  };
-});
-
-/**
- * Handler for reading resources.
- * Retrieves scan results, issue details, or proxy history based on the URI.
- */
-server.setRequestHandler("resources/read", async (request) => {
-  const uri = request.params.uri;
-
-  // Handle scan results
-  if (uri.startsWith("burpsuite://scan/")) {
-    const parts = uri.replace("burpsuite://scan/", "").split("/");
-    const scanId = parts[0];
-
-    if (!mockScans[scanId]) {
-      throw new ProtocolError(
-        ProtocolErrorCode.InvalidRequest,
-        `Scan ${scanId} not found`,
-      );
-    }
-
-    // Handle specific issue
-    if (parts.length > 1 && parts[1] === "issue") {
-      const issueId = parts[2];
-      const issue = mockScans[scanId].issues.find((i) => i.id === issueId);
-
-      if (!issue) {
-        throw new ProtocolError(
-          ProtocolErrorCode.InvalidRequest,
-          `Issue ${issueId} not found in scan ${scanId}`,
-        );
-      }
-
-      return {
-        contents: [
-          {
-            uri,
-            mimeType: "application/json",
-            text: JSON.stringify(issue, null, 2),
-          },
-        ],
-      };
-    }
-
-    // Return full scan
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "application/json",
-          text: JSON.stringify(mockScans[scanId], null, 2),
-        },
-      ],
-    };
-  }
-
-  // Handle proxy history
-  if (uri === "burpsuite://proxy/history") {
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "application/json",
-          text: JSON.stringify(mockProxyHistory, null, 2),
-        },
-      ],
-    };
-  }
-
-  // Handle specific proxy history item
-  if (uri.startsWith("burpsuite://proxy/history/")) {
-    const itemId = uri.replace("burpsuite://proxy/history/", "");
-    const item = mockProxyHistory.find((i) => i.id === itemId);
-
-    if (!item) {
-      throw new ProtocolError(
-        ProtocolErrorCode.InvalidRequest,
-        `Proxy history item ${itemId} not found`,
-      );
-    }
-
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "application/json",
-          text: JSON.stringify(item, null, 2),
-        },
-      ],
-    };
-  }
-
-  // Handle site map
-  if (uri === "burpsuite://sitemap") {
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "application/json",
-          text: JSON.stringify(mockSiteMap, null, 2),
-        },
-      ],
-    };
-  }
-
-  throw new ProtocolError(
-    ProtocolErrorCode.InvalidRequest,
-    `Resource not found: ${uri}`,
-  );
-});
-
-/**
  * Handler for listing available tools.
- * Exposes tools for scanning, retrieving scan status, and accessing proxy history.
  */
 server.setRequestHandler("tools/list", async (): Promise<any> => {
   return {
     tools: [
       {
         name: "start_scan",
-        description: "Start a new vulnerability scan on a target URL",
+        description:
+          "Start a new vulnerability scan on a target URL using Burp Suite " +
+          "Professional's REST API (POST /v0.1/scan). Returns a scan_id " +
+          "(Burp task id) to poll with get_scan_status/get_scan_issues. " +
+          "This launches a real scan against the target and will generate " +
+          "live traffic to it.",
         inputSchema: {
           type: "object",
           properties: {
@@ -438,58 +348,106 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
               type: "string",
               description: "Target URL to scan (e.g., https://example.com)",
             },
-            scan_type: {
-              type: "string",
-              enum: ["passive", "active", "full"],
-              description: "Type of scan to perform",
+            scope: {
+              type: "object",
+              description:
+                "Optional scope object passed through as-is to Burp's scan " +
+                "request body (e.g. { include: [...], exclude: [...] }). " +
+                "The exact shape isn't published by PortSwigger; confirm it " +
+                "against your Burp instance's self-documenting API " +
+                "(http://<host>:<port>/<api-key>/v0.1/<api-key>) if unsure.",
+            },
+            scan_configurations: {
+              type: "array",
+              items: {},
+              description:
+                "Optional list of scan configuration references (e.g. named " +
+                "configurations from Scanner > Scan configurations), passed " +
+                "through as-is. If omitted, Burp uses its default crawl-and-audit " +
+                "configuration.",
+            },
+            application_logins: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  username: { type: "string" },
+                  password: { type: "string" },
+                },
+              },
+              description:
+                "Optional credentials for authenticated scanning, passed " +
+                "through as-is to Burp's scan request body.",
             },
           },
           required: ["target"],
         },
+        annotations: {
+          title: "Start Burp Scan",
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
       },
       {
         name: "get_scan_status",
-        description: "Check the status of a running scan",
+        description:
+          "Check the status of a scan previously started with start_scan, via " +
+          "Burp's GET /v0.1/scan/{task_id}.",
         inputSchema: {
           type: "object",
           properties: {
             scan_id: {
               type: "string",
-              description: "ID of the scan to check",
+              description: "Task id of the scan to check (returned by start_scan)",
             },
           },
           required: ["scan_id"],
+        },
+        annotations: {
+          title: "Get Scan Status",
+          readOnlyHint: true,
+          openWorldHint: true,
         },
       },
       {
         name: "get_scan_issues",
-        description: "Get vulnerability issues found in a scan",
+        description:
+          "Get vulnerability issues found so far by a scan, via Burp's " +
+          "GET /v0.1/scan/{task_id} (issues are embedded in the scan status response).",
         inputSchema: {
           type: "object",
           properties: {
             scan_id: {
               type: "string",
-              description: "ID of the scan",
+              description: "Task id of the scan (returned by start_scan)",
             },
             severity: {
               type: "string",
               enum: ["high", "medium", "low", "info", "all"],
-              description: "Filter issues by severity",
+              description: "Filter issues by severity (default: all)",
             },
           },
           required: ["scan_id"],
         },
+        annotations: {
+          title: "Get Scan Issues",
+          readOnlyHint: true,
+          openWorldHint: true,
+        },
       },
       {
         name: "get_proxy_history",
-        description: "Get HTTP/HTTPS traffic captured by Burp Proxy",
+        description:
+          "Not available via Burp Suite Professional's REST API. Kept for " +
+          "interface compatibility; returns an explanatory error instead of " +
+          "fabricated data. See tool output for details and alternatives " +
+          "(Burp's Montoya extension API or the desktop UI).",
         inputSchema: {
           type: "object",
           properties: {
-            host: {
-              type: "string",
-              description: "Filter by host (optional)",
-            },
+            host: { type: "string", description: "Filter by host (optional)" },
             method: {
               type: "string",
               description: "Filter by HTTP method (optional)",
@@ -504,18 +462,23 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
             },
           },
         },
+        annotations: {
+          title: "Get Proxy History (Not Available)",
+          readOnlyHint: true,
+          openWorldHint: true,
+        },
       },
       {
         name: "get_site_map",
         description:
-          "Get the site structure discovered during scanning and browsing",
+          "Not available via Burp Suite Professional's REST API. Kept for " +
+          "interface compatibility; returns an explanatory error instead of " +
+          "fabricated data. See tool output for details and alternatives " +
+          "(Burp's Montoya extension API or the desktop UI).",
         inputSchema: {
           type: "object",
           properties: {
-            host: {
-              type: "string",
-              description: "Filter by host (optional)",
-            },
+            host: { type: "string", description: "Filter by host (optional)" },
             with_parameters: {
               type: "boolean",
               description: "Only show URLs with parameters (optional)",
@@ -526,6 +489,11 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
             },
           },
         },
+        annotations: {
+          title: "Get Site Map (Not Available)",
+          readOnlyHint: true,
+          openWorldHint: true,
+        },
       },
     ],
   };
@@ -533,233 +501,153 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
 
 /**
  * Handler for tool calls.
- * Implements the functionality for each tool.
  */
 server.setRequestHandler("tools/call", async (request) => {
   switch (request.params.name) {
     case "start_scan": {
-      const target = String(request.params.arguments?.target);
-      const scanType = String(request.params.arguments?.scan_type || "passive");
-
-      if (!target) {
+      const target = request.params.arguments?.target;
+      if (!target || typeof target !== "string") {
         throw new ProtocolError(
           ProtocolErrorCode.InvalidParams,
           "Target URL is required",
         );
       }
 
-      // Create a new scan
-      const scanId = `scan-${Date.now()}`;
-      const scan: Scan = {
-        id: scanId,
-        target,
-        status: "running",
-        startTime: new Date().toISOString(),
-        progress: 0,
-        issues: [],
-      };
-
-      mockScans[scanId] = scan;
-
-      // Simulate scan completion after a delay (in a real implementation, this would be async)
-      setTimeout(() => {
-        const issueCount =
-          scanType === "passive" ? 3 : scanType === "active" ? 8 : 15;
-        mockScans[scanId].issues = generateMockIssues(
-          new URL(target).hostname,
-          issueCount,
+      try {
+        // eslint-disable-next-line no-new
+        new URL(target);
+      } catch {
+        throw new ProtocolError(
+          ProtocolErrorCode.InvalidParams,
+          `"${target}" is not a valid URL`,
         );
-        mockScans[scanId].status = "completed";
-        mockScans[scanId].endTime = new Date().toISOString();
-        mockScans[scanId].progress = 100;
-      }, 5000);
+      }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                scan_id: scanId,
-                message: `Started ${scanType} scan on ${target}`,
-                status: "running",
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      const scope = request.params.arguments?.scope;
+      const scanConfigurationsArg = request.params.arguments?.scan_configurations;
+      const applicationLoginsArg = request.params.arguments?.application_logins;
+
+      try {
+        const { taskId } = await burpClient.startScan({
+          target,
+          scope,
+          scanConfigurations: Array.isArray(scanConfigurationsArg)
+            ? scanConfigurationsArg
+            : undefined,
+          applicationLogins: Array.isArray(applicationLoginsArg)
+            ? applicationLoginsArg
+            : undefined,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  scan_id: taskId,
+                  target,
+                  message: `Scan started on ${target}. Poll get_scan_status with scan_id "${taskId}" for progress.`,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        throw mapBurpApiError(error, `starting a scan on ${target}`);
+      }
     }
 
     case "get_scan_status": {
-      const scanId = String(request.params.arguments?.scan_id);
-
-      if (!scanId || !mockScans[scanId]) {
+      const scanId = coerceScanId(request.params.arguments?.scan_id);
+      if (!scanId) {
         throw new ProtocolError(
-          ProtocolErrorCode.InvalidRequest,
-          `Scan ${scanId} not found`,
+          ProtocolErrorCode.InvalidParams,
+          "scan_id is required",
         );
       }
 
-      const scan = mockScans[scanId];
+      try {
+        const data = await burpClient.getScan(scanId);
+        const status = data["scan_status"] ?? data["status"] ?? "unknown";
+        const metrics = data["scan_metrics"] ?? data["metrics"] ?? null;
+        const issues = extractIssues(data);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                scan_id: scanId,
-                target: scan.target,
-                status: scan.status,
-                progress: scan.progress,
-                start_time: scan.startTime,
-                end_time: scan.endTime,
-                issue_count: scan.issues.length,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  scan_id: scanId,
+                  status,
+                  metrics,
+                  issue_count: issues.length,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        throw mapBurpApiError(error, `getting status for scan ${scanId}`);
+      }
     }
 
     case "get_scan_issues": {
-      const scanId = String(request.params.arguments?.scan_id);
-      const severity = String(request.params.arguments?.severity || "all");
-
-      if (!scanId || !mockScans[scanId]) {
+      const scanId = coerceScanId(request.params.arguments?.scan_id);
+      if (!scanId) {
         throw new ProtocolError(
-          ProtocolErrorCode.InvalidRequest,
-          `Scan ${scanId} not found`,
+          ProtocolErrorCode.InvalidParams,
+          "scan_id is required",
         );
       }
 
-      const scan = mockScans[scanId];
-      let issues = scan.issues;
+      const severityFilter =
+        typeof request.params.arguments?.severity === "string"
+          ? (request.params.arguments.severity as string).toLowerCase()
+          : "all";
 
-      // Filter by severity if specified
-      if (severity !== "all") {
-        issues = issues.filter((issue) => issue.severity === severity);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                scan_id: scanId,
-                target: scan.target,
-                issue_count: issues.length,
-                issues: issues.map((issue) => ({
-                  id: issue.id,
-                  name: issue.name,
-                  severity: issue.severity,
-                  confidence: issue.confidence,
-                  host: issue.host,
-                  path: issue.path,
-                })),
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
-    }
-
-    case "get_proxy_history": {
-      const host = request.params.arguments?.host as string | undefined;
-      const method = request.params.arguments?.method as string | undefined;
-      const statusCode = request.params.arguments?.status_code as
-        number | undefined;
-      const limit = Number(request.params.arguments?.limit || 10);
-
-      let history = [...mockProxyHistory];
-
-      // Apply filters
-      if (host) {
-        history = history.filter((item) => item.host.includes(host));
-      }
-
-      if (method) {
-        history = history.filter(
-          (item) => item.method === method.toUpperCase(),
+      try {
+        const data = await burpClient.getScan(scanId);
+        const issues = extractIssues(data).filter((issue) =>
+          matchesSeverityFilter(issue, severityFilter),
         );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  scan_id: scanId,
+                  issue_count: issues.length,
+                  issues,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        throw mapBurpApiError(error, `getting issues for scan ${scanId}`);
       }
-
-      if (statusCode) {
-        history = history.filter((item) => item.statusCode === statusCode);
-      }
-
-      // Apply limit
-      history = history.slice(0, limit);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                total_items: history.length,
-                items: history.map((item) => ({
-                  id: item.id,
-                  host: item.host,
-                  method: item.method,
-                  url: item.url,
-                  status_code: item.statusCode,
-                  time: item.time,
-                  size: item.size,
-                  mime_type: item.mimeType,
-                })),
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
     }
 
+    case "get_proxy_history":
     case "get_site_map": {
-      const host = request.params.arguments?.host as string | undefined;
-      const withParameters = request.params.arguments?.with_parameters as
-        boolean | undefined;
-      const limit = Number(request.params.arguments?.limit || 20);
-
-      let siteMap = [...mockSiteMap];
-
-      // Apply filters
-      if (host) {
-        siteMap = siteMap.filter((item) =>
-          new URL(item.url).hostname.includes(host),
-        );
-      }
-
-      if (withParameters) {
-        siteMap = siteMap.filter((item) => item.parameters);
-      }
-
-      // Apply limit
-      siteMap = siteMap.slice(0, limit);
-
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                total_items: siteMap.length,
-                items: siteMap,
-              },
-              null,
-              2,
-            ),
+            text: unsupportedFeatureMessage(request.params.name),
           },
         ],
+        isError: true,
       };
     }
 
@@ -777,7 +665,9 @@ server.setRequestHandler("tools/call", async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Burpsuite MCP server running on stdio");
+  console.error(
+    `Burp Suite MCP server running on stdio (BURP_API_URL=${BURP_API_URL})`,
+  );
 
   // Handle errors
   server.onerror = (error) => {

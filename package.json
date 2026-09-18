@@ -1,7 +1,7 @@
 {
   "name": "burpsuite-server",
-  "version": "0.1.0",
-  "description": "A Model Context Protocol server",
+  "version": "0.2.0",
+  "description": "A Model Context Protocol server for Burp Suite Professional's REST API",
   "private": true,
   "type": "module",
   "bin": {
@@ -20,7 +20,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "^2.0.0"
+    "@modelcontextprotocol/server": "^2.0.0",
+    "axios": "^1.20.0"
   },
   "devDependencies": {
     "@types/node": "^24.13.5",
