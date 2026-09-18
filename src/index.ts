@@ -382,6 +382,15 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
           },
           required: ["target"],
         },
+        outputSchema: {
+          type: "object",
+          properties: {
+            scan_id: { type: "string" },
+            target: { type: "string" },
+            message: { type: "string" },
+          },
+          required: ["scan_id", "target", "message"],
+        },
         annotations: {
           title: "Start Burp Scan",
           readOnlyHint: false,
@@ -404,6 +413,16 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
             },
           },
           required: ["scan_id"],
+        },
+        outputSchema: {
+          type: "object",
+          properties: {
+            scan_id: { type: "string" },
+            status: {},
+            metrics: {},
+            issue_count: { type: "integer" },
+          },
+          required: ["scan_id", "status", "issue_count"],
         },
         annotations: {
           title: "Get Scan Status",
@@ -430,6 +449,32 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
             },
           },
           required: ["scan_id"],
+        },
+        outputSchema: {
+          type: "object",
+          properties: {
+            scan_id: { type: "string" },
+            issue_count: { type: "integer" },
+            issues: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  severity: { type: "string" },
+                  confidence: { type: "string" },
+                  name: { type: "string" },
+                  type_index: {},
+                  host: { type: "string" },
+                  path: { type: "string" },
+                  description: { type: "string" },
+                  remediation: { type: "string" },
+                  evidence: {},
+                },
+                required: ["severity", "confidence", "name", "host", "path"],
+              },
+            },
+          },
+          required: ["scan_id", "issue_count", "issues"],
         },
         annotations: {
           title: "Get Scan Issues",
@@ -462,6 +507,14 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
             },
           },
         },
+        outputSchema: {
+          type: "object",
+          properties: {
+            available: { type: "boolean" },
+            message: { type: "string" },
+          },
+          required: ["available", "message"],
+        },
         annotations: {
           title: "Get Proxy History (Not Available)",
           readOnlyHint: true,
@@ -488,6 +541,14 @@ server.setRequestHandler("tools/list", async (): Promise<any> => {
               description: "Maximum number of items to return (default: 20)",
             },
           },
+        },
+        outputSchema: {
+          type: "object",
+          properties: {
+            available: { type: "boolean" },
+            message: { type: "string" },
+          },
+          required: ["available", "message"],
         },
         annotations: {
           title: "Get Site Map (Not Available)",
@@ -539,21 +600,20 @@ server.setRequestHandler("tools/call", async (request) => {
             : undefined,
         });
 
+        const result = {
+          scan_id: taskId,
+          target,
+          message: `Scan started on ${target}. Poll get_scan_status with scan_id "${taskId}" for progress.`,
+        };
+
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  scan_id: taskId,
-                  target,
-                  message: `Scan started on ${target}. Poll get_scan_status with scan_id "${taskId}" for progress.`,
-                },
-                null,
-                2,
-              ),
+              text: JSON.stringify(result, null, 2),
             },
           ],
+          structuredContent: result,
         };
       } catch (error) {
         throw mapBurpApiError(error, `starting a scan on ${target}`);
@@ -575,22 +635,21 @@ server.setRequestHandler("tools/call", async (request) => {
         const metrics = data["scan_metrics"] ?? data["metrics"] ?? null;
         const issues = extractIssues(data);
 
+        const result = {
+          scan_id: scanId,
+          status,
+          metrics,
+          issue_count: issues.length,
+        };
+
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  scan_id: scanId,
-                  status,
-                  metrics,
-                  issue_count: issues.length,
-                },
-                null,
-                2,
-              ),
+              text: JSON.stringify(result, null, 2),
             },
           ],
+          structuredContent: result,
         };
       } catch (error) {
         throw mapBurpApiError(error, `getting status for scan ${scanId}`);
@@ -617,21 +676,20 @@ server.setRequestHandler("tools/call", async (request) => {
           matchesSeverityFilter(issue, severityFilter),
         );
 
+        const result = {
+          scan_id: scanId,
+          issue_count: issues.length,
+          issues,
+        };
+
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  scan_id: scanId,
-                  issue_count: issues.length,
-                  issues,
-                },
-                null,
-                2,
-              ),
+              text: JSON.stringify(result, null, 2),
             },
           ],
+          structuredContent: result,
         };
       } catch (error) {
         throw mapBurpApiError(error, `getting issues for scan ${scanId}`);
@@ -640,13 +698,15 @@ server.setRequestHandler("tools/call", async (request) => {
 
     case "get_proxy_history":
     case "get_site_map": {
+      const message = unsupportedFeatureMessage(request.params.name);
       return {
         content: [
           {
             type: "text",
-            text: unsupportedFeatureMessage(request.params.name),
+            text: message,
           },
         ],
+        structuredContent: { available: false, message },
         isError: true,
       };
     }
