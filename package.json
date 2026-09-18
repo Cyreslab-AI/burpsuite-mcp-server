@@ -16,11 +16,14 @@
     "watch": "tsc --watch",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "0.6.0"
+    "@modelcontextprotocol/server": "^2.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.11.24",
-    "typescript": "^5.3.3"
+    "@types/node": "^24.13.5",
+    "typescript": "^5.9.3"
   }
 }
